@@ -109,6 +109,61 @@ def _format_badges(badges: dict) -> list[str]:
     return lines
 
 
+def _format_install(install: dict) -> list[str]:
+    """Format install data into readable lines for model consumption."""
+    lines = []
+    if not install:
+        return lines
+
+    lines.append("\nInstall Info:")
+
+    # Package install commands
+    pkg_types = install.get("package_types", [])
+    pkg_ids = install.get("package_identifiers", [])
+    if pkg_types and pkg_ids:
+        for ptype, pid in zip(pkg_types, pkg_ids):
+            if ptype == "npm":
+                lines.append(f"  npm: npx -y {pid}")
+            elif ptype == "pypi":
+                lines.append(f"  pypi: uvx {pid}")
+            elif ptype == "oci":
+                lines.append(f"  docker: {pid}")
+            else:
+                lines.append(f"  {ptype}: {pid}")
+
+    # Transport
+    transports = install.get("transport_types", [])
+    if transports:
+        lines.append(f"  Transport: {', '.join(transports)}")
+
+    # Version
+    version = install.get("version")
+    if version:
+        lines.append(f"  Version: {version}")
+
+    # Env vars
+    env_vars = install.get("env_vars", [])
+    if env_vars:
+        required = [v for v in env_vars if v.get("is_required")]
+        optional = [v for v in env_vars if not v.get("is_required")]
+        secret_note = lambda v: " (secret)" if v.get("is_secret") else ""
+        if required:
+            lines.append("  Required env vars:")
+            for v in required:
+                lines.append(f"    {v['name']}{secret_note(v)}")
+        if optional:
+            lines.append("  Optional env vars:")
+            for v in optional:
+                lines.append(f"    {v['name']}{secret_note(v)}")
+
+    # Repo
+    repo = install.get("repo_url")
+    if repo:
+        lines.append(f"  Source: {repo}")
+
+    return lines
+
+
 def _format_server(server: dict, detail: bool = True) -> str:
     """Format a single server result for readable output."""
     scores = server.get("scores", {})
@@ -140,6 +195,10 @@ def _format_server(server: dict, detail: bool = True) -> str:
         if badges:
             lines.extend(_format_badges(badges))
 
+        install = server.get("install", {})
+        if install:
+            lines.extend(_format_install(install))
+
     return "\n".join(lines)
 
 
@@ -151,7 +210,11 @@ def _format_server_line(s: dict, show_scores: bool = False) -> str:
     targets = s.get("targets", [])
     target_str = f" ({', '.join(targets)})" if targets else ""
 
-    line = f"- {s['name']}: {s['trust_score']}/100 ({s['trust_label']}){verified}{flag_str}{target_str}"
+    # Package type indicator (works with both flat search results and nested install)
+    pkg_types = s.get("package_types") or (s.get("install") or {}).get("package_types", [])
+    pkg_str = f" [pkg: {','.join(pkg_types)}]" if pkg_types else ""
+
+    line = f"- {s['name']}: {s['trust_score']}/100 ({s['trust_label']}){verified}{flag_str}{target_str}{pkg_str}"
 
     if show_scores:
         scores = s.get("scores", {})
