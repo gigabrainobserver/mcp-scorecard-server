@@ -28,7 +28,7 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://mcp-scorecard.ai"
-Repository = "https://github.com/gigabrain-observer/mcp-scorecard-server"
+Repository = "https://github.com/gigabrainobserver/mcp-scorecard-server"
 
 [project.scripts]
 mcp-scorecard-server = "mcp_scorecard_server.server:main"

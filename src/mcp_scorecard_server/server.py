@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
 
 import httpx
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 
 DEFAULT_API_URL = "https://api.mcp-scorecard.ai"
 
@@ -39,11 +39,77 @@ async def lifespan(server: FastMCP) -> AsyncIterator[dict]:
 mcp = FastMCP("mcp-scorecard", lifespan=lifespan)
 
 
-def _client(ctx) -> httpx.AsyncClient:
+def _client(ctx: Context) -> httpx.AsyncClient:
     return ctx.request_context.lifespan_context["client"]
 
 
-def _format_server(server: dict) -> str:
+def _error(resp: httpx.Response) -> str:
+    """Format an API error with status and body for debugging."""
+    try:
+        body = resp.json()
+        msg = body.get("error", {}).get("message", resp.text)
+    except Exception:
+        msg = resp.text
+    return f"API error {resp.status_code}: {msg}"
+
+
+def _format_badges(badges: dict) -> list[str]:
+    """Format badge data into readable lines."""
+    lines = []
+
+    # Security badges
+    security = badges.get("security", [])
+    if security:
+        items = []
+        for b in security:
+            icon = "+" if b.get("level") == "good" else ("-" if b.get("level") == "warn" else "~")
+            items.append(f"{icon} {b['label']}: {b['value']}")
+        lines.append("\nSecurity:")
+        lines.extend(f"  {i}" for i in items)
+
+    # Activity badges
+    activity = badges.get("activity", [])
+    if activity:
+        items = []
+        for b in activity:
+            icon = "+" if b.get("level") == "good" else ("-" if b.get("level") == "warn" else "~")
+            items.append(f"{icon} {b['label']}: {b['value']}")
+        lines.append("\nActivity:")
+        lines.extend(f"  {i}" for i in items)
+
+    # Popularity (raw numbers)
+    pop = badges.get("popularity", {})
+    if pop:
+        parts = []
+        if pop.get("stars"):
+            parts.append(f"{pop['stars']:,} stars")
+        if pop.get("forks"):
+            parts.append(f"{pop['forks']:,} forks")
+        if pop.get("watchers"):
+            parts.append(f"{pop['watchers']:,} watchers")
+        if parts:
+            lines.append(f"\nPopularity: {', '.join(parts)}")
+
+    # Provenance checks
+    prov = badges.get("provenance", [])
+    if prov:
+        passes = []
+        fails = []
+        for b in prov:
+            if b.get("type") == "bool":
+                (passes if b.get("value") else fails).append(b["label"])
+            else:
+                passes.append(f"{b['label']}: {b['value']}")
+        lines.append("\nProvenance:")
+        for p in passes:
+            lines.append(f"  + {p}")
+        for f in fails:
+            lines.append(f"  - {f}")
+
+    return lines
+
+
+def _format_server(server: dict, detail: bool = True) -> str:
     """Format a single server result for readable output."""
     scores = server.get("scores", {})
     flags = server.get("flags", [])
@@ -69,11 +135,36 @@ def _format_server(server: dict) -> str:
     if targets:
         lines.append(f"Targets: {', '.join(targets)}")
 
+    if detail:
+        badges = server.get("badges", {})
+        if badges:
+            lines.extend(_format_badges(badges))
+
     return "\n".join(lines)
 
 
+def _format_server_line(s: dict, show_scores: bool = False) -> str:
+    """Format a single server as a one-line summary."""
+    flags = s.get("flags", [])
+    flag_str = f" [{', '.join(flags)}]" if flags else ""
+    verified = " [Verified]" if s.get("verified_publisher") else ""
+    targets = s.get("targets", [])
+    target_str = f" ({', '.join(targets)})" if targets else ""
+
+    line = f"- {s['name']}: {s['trust_score']}/100 ({s['trust_label']}){verified}{flag_str}{target_str}"
+
+    if show_scores:
+        scores = s.get("scores", {})
+        if scores:
+            parts = [f"P:{scores.get('provenance','?')}", f"M:{scores.get('maintenance','?')}",
+                     f"Pop:{scores.get('popularity','?')}", f"Perm:{scores.get('permissions','?')}"]
+            line += f"  [{'/'.join(parts)}]"
+
+    return line
+
+
 @mcp.tool()
-async def check_server_trust(ctx, name: str) -> str:
+async def check_server_trust(ctx: Context, name: str) -> str:
     """Check the trust score and safety details for a specific MCP server.
 
     Use this to evaluate whether an MCP server is safe to connect to.
@@ -88,14 +179,14 @@ async def check_server_trust(ctx, name: str) -> str:
     if resp.status_code == 404:
         return f"Server '{name}' not found. Try search_servers to find it by keyword."
     if resp.status_code != 200:
-        return f"API error: {resp.status_code}"
+        return _error(resp)
 
     data = resp.json().get("data", {})
-    return _format_server(data)
+    return _format_server(data, detail=True)
 
 
 @mcp.tool()
-async def search_servers(ctx, query: str, limit: int = 10) -> str:
+async def search_servers(ctx: Context, query: str, limit: int = 10) -> str:
     """Search for MCP servers by name keyword.
 
     Use this when you don't know the exact server name. Returns matching
@@ -110,7 +201,7 @@ async def search_servers(ctx, query: str, limit: int = 10) -> str:
     resp = await client.get("/v1/search", params={"q": query, "limit": limit})
 
     if resp.status_code != 200:
-        return f"API error: {resp.status_code}"
+        return _error(resp)
 
     body = resp.json()
     results = body.get("data", [])
@@ -120,19 +211,14 @@ async def search_servers(ctx, query: str, limit: int = 10) -> str:
 
     lines = [f"Found {len(results)} server(s) matching '{query}':\n"]
     for s in results:
-        flags = s.get("flags", [])
-        flag_str = f" [{', '.join(flags)}]" if flags else ""
-        verified = " [Verified]" if s.get("verified_publisher") else ""
-        lines.append(
-            f"- {s['name']}: {s['trust_score']}/100 ({s['trust_label']}){verified}{flag_str}"
-        )
+        lines.append(_format_server_line(s))
 
     return "\n".join(lines)
 
 
 @mcp.tool()
 async def list_servers(
-    ctx,
+    ctx: Context,
     min_score: int | None = None,
     flags: str | None = None,
     target: str | None = None,
@@ -172,7 +258,7 @@ async def list_servers(
     resp = await client.get("/v1/servers", params=params)
 
     if resp.status_code != 200:
-        return f"API error: {resp.status_code}"
+        return _error(resp)
 
     body = resp.json()
     results = body.get("data", [])
@@ -184,11 +270,7 @@ async def list_servers(
 
     lines = [f"Showing {len(results)} of {total} servers:\n"]
     for s in results:
-        flag_str = f" [{', '.join(s.get('flags', []))}]" if s.get("flags") else ""
-        verified = " [Verified]" if s.get("verified_publisher") else ""
-        lines.append(
-            f"- {s['name']}: {s['trust_score']}/100 ({s['trust_label']}){verified}{flag_str}"
-        )
+        lines.append(_format_server_line(s, show_scores=True))
 
     if meta.get("total") and meta["total"] > offset + limit:
         lines.append(f"\n(Use offset={offset + limit} to see more)")
@@ -197,7 +279,7 @@ async def list_servers(
 
 
 @mcp.tool()
-async def get_ecosystem_stats(ctx) -> str:
+async def get_ecosystem_stats(ctx: Context) -> str:
     """Get aggregate statistics about the MCP server ecosystem.
 
     Returns total server count, average/median trust scores, score distribution
@@ -207,13 +289,14 @@ async def get_ecosystem_stats(ctx) -> str:
     resp = await client.get("/v1/stats")
 
     if resp.status_code != 200:
-        return f"API error: {resp.status_code}"
+        return _error(resp)
 
     stats = resp.json().get("data", {})
+    total = stats.get("total_servers", 0)
 
     lines = [
         "## MCP Ecosystem Statistics\n",
-        f"Total Servers: {stats.get('total_servers', '?')}",
+        f"Total Servers: {total:,}",
         f"Average Trust Score: {stats.get('average_score', '?')}/100",
         f"Median Trust Score: {stats.get('median_score', '?')}/100",
         f"Verified Publishers: {stats.get('verified_publishers', '?')}",
@@ -224,13 +307,14 @@ async def get_ecosystem_stats(ctx) -> str:
     for label in ["High Trust", "Moderate Trust", "Low Trust", "Very Low Trust", "Unknown/Suspicious"]:
         count = dist.get(label, 0)
         if count:
-            lines.append(f"  {label}: {count}")
+            pct = f" ({count * 100 / total:.1f}%)" if total else ""
+            lines.append(f"  {label}: {count:,}{pct}")
 
     flag_summary = stats.get("flag_summary", {})
     if flag_summary:
         lines.append("\nFlag Summary:")
         for flag, count in sorted(flag_summary.items(), key=lambda x: -x[1]):
-            lines.append(f"  {flag}: {count}")
+            lines.append(f"  {flag}: {count:,}")
 
     return "\n".join(lines)
 
